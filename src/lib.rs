@@ -41,6 +41,32 @@
 //! `admin` scope (a plain `read`/`write` key cannot manage keys). A config
 //! `bootstrap_admin_key` is an always-valid break-glass that grants full
 //! `[read, write, admin]`, so an operator can never lock themselves out.
+//!
+//! ## Management UI page (embedded panel)
+//!
+//! The plugin also *serves its own* management page — a small static site of
+//! HTML ([`ADMIN_HTML`]) plus two same-origin assets, the stylesheet
+//! ([`ADMIN_CSS`], at `/plugin-api/v1/admin.css`) and the script
+//! ([`ADMIN_JS`], at `/plugin-api/v1/admin.js`), served at
+//! `GET /plugin-api/v1/admin`. The page links the assets rather than inlining
+//! them, so it loads under a strict `script-src 'self'; style-src 'self'` CSP
+//! (no `'unsafe-inline'`). It is declared as a `ui_panels` entry in the
+//! [`manifest`], so Peckboard lists it as a link in the **user dropdown menu**
+//! and embeds it in a sandboxed iframe.
+//!
+//! That iframe is sandboxed **without** `allow-same-origin` and core forwards
+//! no host session, so the page runs with an *opaque* origin: it cannot read
+//! the host app's cookies/JWT, cannot use `localStorage`, and its `fetch`
+//! calls back to `/plugin-api/*` are **cross-origin**. (The `'self'` CSP still
+//! matches the page's *response-URL* origin, so the linked same-origin
+//! `admin.css`/`admin.js` load fine — only scripting is opaque-origin.) Two
+//! consequences this plugin handles: (1) every response carries permissive
+//! CORS headers and an `OPTIONS /plugin-api/v1/*` catch-all answers the
+//! browser's preflight ([`preflight`]); (2) the page asks the operator to
+//! paste an `admin` key (or the bootstrap admin key), kept in memory only, to
+//! authorize the `/plugin-api/v1/keys` calls. CORS is open (`*`) but
+//! credential-free, so it cannot leak the host session — a caller still needs
+//! a valid key.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -87,12 +113,24 @@ unsafe extern "C" {
 /// dispatch table in [`serve_http`] and this list must stay in sync.
 const ROUTES: &[&str] = &[
     "GET /plugin-api/v1/health",
+    // The self-served management UI page (declared as a ui_panel below) and
+    // its two same-origin assets. CSS/JS are separate routes (not inlined) so
+    // they load under a strict `script-src 'self' / style-src 'self'` CSP,
+    // which forbids inline `<script>`/`<style>`.
+    "GET /plugin-api/v1/admin",
+    "GET /plugin-api/v1/admin.css",
+    "GET /plugin-api/v1/admin.js",
     "GET /plugin-api/v1/projects",
     "GET /plugin-api/v1/cards",
     "POST /plugin-api/v1/cards",
     "GET /plugin-api/v1/keys",
     "POST /plugin-api/v1/keys",
     "DELETE /plugin-api/v1/keys/:id",
+    // CORS preflight. The admin page is embedded in a sandboxed iframe with an
+    // opaque origin, so its management `fetch`es are cross-origin and the
+    // browser sends an `OPTIONS` preflight first. This catch-all claims every
+    // preflight under our prefix so [`preflight`] can answer it uniformly.
+    "OPTIONS /plugin-api/v1/*rest",
 ];
 
 /// Scope required to read data.
@@ -186,6 +224,13 @@ pub fn manifest() -> FnResult<String> {
     let manifest = serde_json::json!({
         "hooks": ["http.request.before"],
         "http_routes": ROUTES,
+        // The management page this plugin serves at `/plugin-api/v1/admin`,
+        // surfaced by Peckboard as a link in the user dropdown menu, opened in
+        // a sandboxed iframe. The path must stay under `/plugin-api/` or core
+        // drops it.
+        "ui_panels": [
+            { "id": "api-keys", "title": "API Keys", "path": "/plugin-api/v1/admin" }
+        ],
     });
     Ok(manifest.to_string())
 }
@@ -268,8 +313,22 @@ fn serve_http(payload: serde_json::Value) -> String {
     };
 
     let method = req.method.to_ascii_uppercase();
+
+    // CORS preflight: the admin page is embedded in a sandboxed iframe with an
+    // opaque origin, so its management calls are cross-origin and arrive with
+    // an `OPTIONS` preflight. Answer any preflight under our prefix uniformly,
+    // before routing — no auth, no body.
+    if method == "OPTIONS" {
+        return preflight();
+    }
+
     match (method.as_str(), req.path.as_str()) {
         ("GET", "/plugin-api/v1/health") => health(),
+        ("GET", "/plugin-api/v1/admin") => admin_page(),
+        ("GET", "/plugin-api/v1/admin.css") => admin_asset("text/css; charset=utf-8", ADMIN_CSS),
+        ("GET", "/plugin-api/v1/admin.js") => {
+            admin_asset("text/javascript; charset=utf-8", ADMIN_JS)
+        }
 
         ("GET", "/plugin-api/v1/projects") => guard(&req, SCOPE_READ, |_| list_projects()),
         ("GET", "/plugin-api/v1/cards") => guard(&req, SCOPE_READ, list_cards),
@@ -872,12 +931,86 @@ fn format_unix_utc(secs: i64) -> String {
 
 /// Wrap an HTTP response (`status` + JSON `body`) as a `Verdict::Allow`
 /// payload, the shape core's `serve_http` expects.
+///
+/// Every response carries `access-control-allow-origin: *` so the embedded
+/// admin page (a sandboxed, opaque-origin iframe) can read it cross-origin.
+/// This is safe: there are no credentials (cookies) in play, so `*` cannot
+/// leak the host session — a caller still needs a valid API key.
 fn response(status: u16, body: serde_json::Value) -> String {
     serde_json::json!({
         "verdict": "allow",
         "payload": {
             "status": status,
-            "headers": { "content-type": "application/json" },
+            "headers": {
+                "content-type": "application/json",
+                "access-control-allow-origin": "*",
+            },
+            "body": body,
+        },
+    })
+    .to_string()
+}
+
+/// Answer a CORS preflight (`OPTIONS`) for the plugin-owned prefix: `204` with
+/// the methods and headers the admin page's cross-origin calls use. No auth.
+fn preflight() -> String {
+    serde_json::json!({
+        "verdict": "allow",
+        "payload": {
+            "status": 204,
+            "headers": {
+                "access-control-allow-origin": "*",
+                "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+                "access-control-allow-headers": "authorization, content-type, x-api-key",
+                "access-control-max-age": "600",
+            },
+            "body": "",
+        },
+    })
+    .to_string()
+}
+
+/// `GET /plugin-api/v1/admin` — serve the management UI page.
+///
+/// No auth: the page itself holds no secrets; it asks the operator to paste an
+/// `admin` key, then drives the `/plugin-api/v1/keys` endpoints. A strict CSP
+/// limits it to loading its own `admin.css`/`admin.js` (`script-src 'self';
+/// style-src 'self'`, no `'unsafe-inline'`) and talking only to its own origin
+/// (`connect-src 'self'`) — defense in depth for an embedded page. The `'self'`
+/// sources match the page's response-URL origin, so the linked same-origin
+/// assets load even though the sandboxed iframe's scripting origin is opaque.
+fn admin_page() -> String {
+    serde_json::json!({
+        "verdict": "allow",
+        "payload": {
+            "status": 200,
+            "headers": {
+                "content-type": "text/html; charset=utf-8",
+                "access-control-allow-origin": "*",
+                "x-content-type-options": "nosniff",
+                "content-security-policy":
+                    "default-src 'none'; connect-src 'self'; style-src 'self'; \
+                     script-src 'self'; base-uri 'none'; form-action 'none'",
+            },
+            "body": ADMIN_HTML,
+        },
+    })
+    .to_string()
+}
+
+/// Serve one of the admin page's same-origin static assets (`admin.css` /
+/// `admin.js`) with the given `content_type`. No auth — these hold no secrets;
+/// `nosniff` keeps the browser from re-interpreting the declared type.
+fn admin_asset(content_type: &str, body: &str) -> String {
+    serde_json::json!({
+        "verdict": "allow",
+        "payload": {
+            "status": 200,
+            "headers": {
+                "content-type": content_type,
+                "access-control-allow-origin": "*",
+                "x-content-type-options": "nosniff",
+            },
             "body": body,
         },
     })
@@ -903,6 +1036,7 @@ fn unauthorized() -> String {
             "status": 401,
             "headers": {
                 "content-type": "application/json",
+                "access-control-allow-origin": "*",
                 "www-authenticate": "Bearer realm=\"plugin-api\""
             },
             "body": { "error": "missing or invalid API key" },
@@ -916,6 +1050,254 @@ fn unauthorized() -> String {
 pub fn shutdown() -> FnResult<String> {
     Ok("{}".to_string())
 }
+
+/// The management UI page markup served at `GET /plugin-api/v1/admin`.
+///
+/// Markup only — the stylesheet ([`ADMIN_CSS`]) and script ([`ADMIN_JS`]) are
+/// linked as same-origin assets (`admin.css` / `admin.js`, resolved relative
+/// to this page's path) rather than inlined, so the page loads under the
+/// strict `script-src 'self'; style-src 'self'` CSP from [`admin_page`] with
+/// no `'unsafe-inline'`. The script keeps the operator's admin key in memory
+/// only (the opaque-origin iframe cannot use `localStorage`) and talks to the
+/// `/plugin-api/v1/keys` endpoints to list, create (show-once secret), and
+/// revoke keys.
+const ADMIN_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peckboard API Keys</title>
+<link rel="stylesheet" href="admin.css">
+</head>
+<body>
+<h1>Peckboard API Keys</h1>
+<p class="sub">Manage scoped API keys for the public <code>/plugin-api</code> surface.</p>
+
+<div class="card">
+  <div class="row">
+    <div>
+      <label for="adminKey">Admin key</label>
+      <input id="adminKey" type="password" placeholder="A key with the admin scope, or the bootstrap admin key" autocomplete="off" spellcheck="false">
+    </div>
+    <button id="connect" class="primary">Connect</button>
+  </div>
+  <p class="muted hint">Kept in memory only &mdash; re-enter it if you reload this page.</p>
+  <div id="authStatus" class="status"></div>
+</div>
+
+<div id="main" class="hidden">
+  <div class="card">
+    <h2>Create a Key</h2>
+    <div class="row">
+      <div>
+        <label for="label">Label (optional)</label>
+        <input id="label" type="text" placeholder="e.g. CI read-only" autocomplete="off">
+      </div>
+    </div>
+    <label class="mt10">Scopes</label>
+    <div class="checks">
+      <label><input type="checkbox" class="scope" value="read"> read</label>
+      <label><input type="checkbox" class="scope" value="write"> write</label>
+      <label><input type="checkbox" class="scope" value="admin"> admin</label>
+    </div>
+    <button id="create" class="primary">Create key</button>
+    <div id="createStatus" class="status"></div>
+    <div id="secretBox" class="secret-box hidden">
+      <label>New secret &mdash; copy it now</label>
+      <div class="row">
+        <div><input id="secret" type="text" readonly></div>
+        <button id="copy">Copy</button>
+      </div>
+      <p class="warn">Shown once and not retrievable again (only its hash is stored). Save it somewhere safe.</p>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row row-center">
+      <h2 class="h2-flush">Keys</h2>
+      <button id="refresh">Refresh</button>
+    </div>
+    <div id="listStatus" class="status"></div>
+    <div id="keysWrap"></div>
+  </div>
+</div>
+
+<script src="admin.js"></script>
+</body>
+</html>
+"##;
+
+/// The management page's stylesheet, served verbatim at
+/// `GET /plugin-api/v1/admin.css` (linked by [`ADMIN_HTML`]).
+const ADMIN_CSS: &str = r##":root{--bg:#0f1115;--panel:#1a1d24;--border:#2a2f3a;--fg:#e6e9ef;--muted:#9aa3b2;--accent:#4f8cff;--danger:#e5534b;--ok:#3fb950}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{font:14px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg);padding:16px}
+h1{font-size:18px;margin:0 0 4px}
+h2{font-size:15px;margin:0 0 12px}
+.sub{color:var(--muted);margin:0 0 16px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+input[type=text],input[type=password]{width:100%;padding:8px 10px;background:#0c0e12;border:1px solid var(--border);border-radius:6px;color:var(--fg);font:inherit}
+.row{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap}
+.row>div{flex:1;min-width:160px}
+button{padding:8px 14px;border:1px solid var(--border);border-radius:6px;background:#222734;color:var(--fg);font:inherit;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{background:transparent;border-color:var(--danger);color:var(--danger)}
+button:disabled{opacity:.5;cursor:not-allowed}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.scopes span{display:inline-block;padding:1px 6px;border:1px solid var(--border);border-radius:4px;margin-right:4px;font-size:11px}
+.status{padding:8px 10px;border-radius:6px;margin-top:8px;font-size:13px;display:none}
+.status.err{display:block;background:rgba(229,83,75,.15);border:1px solid var(--danger)}
+.status.ok{display:block;background:rgba(63,185,80,.12);border:1px solid var(--ok)}
+.checks{display:flex;gap:14px;flex-wrap:wrap;margin:4px 0 12px}
+.checks label{display:flex;align-items:center;gap:6px;color:var(--fg);font-size:13px;margin:0}
+.secret-box{margin-top:12px;padding:12px;border:1px dashed var(--ok);border-radius:6px;background:rgba(63,185,80,.08)}
+.secret-box .warn{color:var(--muted);font-size:12px;margin:6px 0 0}
+.muted{color:var(--muted)}
+.hint{margin:8px 0 0;font-size:12px}
+.hidden{display:none}
+.empty{color:var(--muted);padding:12px 0}
+.mt10{margin-top:10px}
+.row-center{align-items:center}
+.h2-flush{margin:0;flex:1}
+"##;
+
+/// The management page's behaviour, served verbatim at
+/// `GET /plugin-api/v1/admin.js` (loaded by [`ADMIN_HTML`]). Keeps the
+/// operator's admin key in memory only and drives the `/plugin-api/v1/keys`
+/// endpoints (list / create show-once secret / revoke).
+const ADMIN_JS: &str = r##"(function(){
+  "use strict";
+  var BASE = "/plugin-api/v1";
+  var adminKey = "";
+
+  function $(id){ return document.getElementById(id); }
+  function show(el){ el.classList.remove("hidden"); }
+  function hide(el){ el.classList.add("hidden"); }
+  function setStatus(el, msg, kind){
+    el.textContent = msg || "";
+    el.className = "status" + (msg ? " " + kind : "");
+  }
+  function esc(s){
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+      return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+    });
+  }
+
+  async function api(method, path, body){
+    var headers = { "Authorization": "Bearer " + adminKey };
+    if (body) headers["Content-Type"] = "application/json";
+    var opts = { method: method, headers: headers };
+    if (body) opts.body = JSON.stringify(body);
+    var res, data = null;
+    try {
+      res = await fetch(BASE + path, opts);
+    } catch (e) {
+      return { status: 0, ok: false, data: null, neterr: true };
+    }
+    try { data = await res.json(); } catch (e) { /* e.g. 204, empty body */ }
+    return { status: res.status, ok: res.ok, data: data };
+  }
+
+  function errMsg(r, fallback){
+    if (r.neterr) return "Network error reaching the API.";
+    if (r.data && r.data.error) return r.data.error;
+    if (r.status === 401) return "Invalid admin key.";
+    if (r.status === 403) return "This key lacks the admin scope.";
+    return fallback || ("Request failed (" + r.status + ").");
+  }
+
+  async function connect(){
+    adminKey = $("adminKey").value.trim();
+    if (!adminKey){ setStatus($("authStatus"), "Enter an admin key.", "err"); return; }
+    setStatus($("authStatus"), "Connecting…", "ok");
+    var r = await api("GET", "/keys");
+    if (!r.ok){ hide($("main")); setStatus($("authStatus"), errMsg(r), "err"); return; }
+    setStatus($("authStatus"), "Connected.", "ok");
+    show($("main"));
+    renderKeys((r.data && r.data.keys) || []);
+  }
+
+  async function refresh(){
+    var r = await api("GET", "/keys");
+    if (!r.ok){ setStatus($("listStatus"), errMsg(r), "err"); return; }
+    setStatus($("listStatus"), "", "");
+    renderKeys((r.data && r.data.keys) || []);
+  }
+
+  function renderKeys(keys){
+    var wrap = $("keysWrap");
+    if (!keys.length){ wrap.innerHTML = '<div class="empty">No keys yet. Create one above.</div>'; return; }
+    var rows = keys.map(function(k){
+      var scopes = (k.scopes || []).map(function(s){ return '<span>' + esc(s) + '</span>'; }).join("");
+      return '<tr>' +
+        '<td>' + (k.label ? esc(k.label) : '<span class="muted">—</span>') + '</td>' +
+        '<td class="scopes">' + (scopes || '<span class="muted">—</span>') + '</td>' +
+        '<td><code>' + esc(k.masked) + '</code></td>' +
+        '<td class="muted">' + esc(k.created) + '</td>' +
+        '<td><button class="danger" data-id="' + esc(k.id) + '">Revoke</button></td>' +
+      '</tr>';
+    }).join("");
+    wrap.innerHTML = '<table><thead><tr><th>Label</th><th>Scopes</th><th>Key</th><th>Created</th><th></th></tr></thead><tbody>' + rows + '</tbody></table>';
+    Array.prototype.forEach.call(wrap.querySelectorAll("button[data-id]"), function(btn){
+      btn.addEventListener("click", function(){ revoke(btn.getAttribute("data-id")); });
+    });
+  }
+
+  async function create(){
+    var label = $("label").value.trim();
+    var scopes = Array.prototype.map.call(document.querySelectorAll(".scope:checked"), function(c){ return c.value; });
+    if (!scopes.length){ setStatus($("createStatus"), "Select at least one scope.", "err"); return; }
+    hide($("secretBox"));
+    var body = { scopes: scopes };
+    if (label) body.label = label;
+    var r = await api("POST", "/keys", body);
+    if (r.status !== 201){ setStatus($("createStatus"), errMsg(r, "Could not create key."), "err"); return; }
+    setStatus($("createStatus"), "Key created.", "ok");
+    $("secret").value = (r.data && r.data.key) || "";
+    show($("secretBox"));
+    $("label").value = "";
+    Array.prototype.forEach.call(document.querySelectorAll(".scope"), function(c){ c.checked = false; });
+    refresh();
+  }
+
+  async function revoke(id){
+    if (!window.confirm("Revoke this key? Any client using it will immediately stop working.")) return;
+    var r = await api("DELETE", "/keys/" + encodeURIComponent(id));
+    if (!r.ok){ setStatus($("listStatus"), errMsg(r, "Could not revoke key."), "err"); return; }
+    setStatus($("listStatus"), "Key revoked.", "ok");
+    refresh();
+  }
+
+  function copySecret(){
+    var input = $("secret");
+    input.focus(); input.select();
+    var done = function(){
+      var b = $("copy"); var t = b.textContent;
+      b.textContent = "Copied"; setTimeout(function(){ b.textContent = t; }, 1200);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(input.value).then(done, function(){
+        try { document.execCommand("copy"); done(); } catch (e) {}
+      });
+    } else {
+      try { document.execCommand("copy"); done(); } catch (e) {}
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function(){
+    $("connect").addEventListener("click", connect);
+    $("adminKey").addEventListener("keydown", function(e){ if (e.key === "Enter") connect(); });
+    $("create").addEventListener("click", create);
+    $("refresh").addEventListener("click", refresh);
+    $("copy").addEventListener("click", copySecret);
+  });
+})();
+"##;
 
 // NOTE: this crate compiles only to `wasm32-unknown-unknown` — the
 // `#[plugin_fn]` / `#[host_fn]` exports and the WASI imports reference host
