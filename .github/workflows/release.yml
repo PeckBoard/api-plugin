@@ -1,0 +1,53 @@
+name: release
+
+# On a version tag (v*), build the WASM plugin and attach it to a GitHub
+# Release so the binary is downloadable without a local Rust toolchain.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  # Required to create/modify the GitHub Release and upload its assets.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build WASM (release)
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Stage release asset
+        # Name the asset api.wasm — that is the file stem Peckboard uses as
+        # the plugin's config key when dropped into <dataDir>/plugins/.
+        run: cp target/wasm32-unknown-unknown/release/peckboard_api_plugin.wasm api.wasm
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: api.wasm
+          fail_on_unmatched_files: true

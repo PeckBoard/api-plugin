@@ -32,6 +32,18 @@ The artifact is:
 target/wasm32-unknown-unknown/release/peckboard_api_plugin.wasm
 ```
 
+## CI
+
+GitHub Actions builds the plugin on every push and pull request
+(`.github/workflows/build.yml`): it installs the `wasm32-unknown-unknown`
+target, runs `cargo fmt --check` and `cargo clippy --all-targets -- -D
+warnings`, builds the release WASM, and uploads it as a build artifact. The
+cargo registry and `target/` are cached between runs.
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the
+WASM and attaches it (as `api.wasm`) to the corresponding GitHub Release, so the
+binary is downloadable without a local toolchain.
+
 ## Install
 
 Peckboard loads `.wasm` files from `<dataDir>/plugins/` at startup. **The
