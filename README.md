@@ -10,10 +10,46 @@ endpoint.
 See `peckboard/docs/architecture/plugins.md` ("HTTP Route Hooks" and "Plugin
 API (Host Functions)") for the full contract.
 
-> **Status: scaffold.** Today the plugin declares one route,
-> `GET /plugin-api/v1/health`, and answers it (and any future claimed route)
-> with a 200 health response. API-key authentication and the real endpoints
-> land in a follow-up card.
+## Endpoints
+
+All paths are under `/plugin-api/v1`. The scope in brackets is the API-key
+scope the route requires (see [Authentication](#authentication)).
+
+| Method & path    | Scope   | Backed by                 | Description                                          |
+| ---------------- | ------- | ------------------------- | --------------------------------------------------- |
+| `GET  /health`   | —       | (none)                    | Liveness. No auth.                                  |
+| `GET  /projects` | `read`  | `peckboard_list_projects` | List all projects.                                  |
+| `GET  /cards`    | `read`  | `peckboard_list_cards`    | List cards. Optional `?project_id=&step=` filters.  |
+| `POST /cards`    | `write` | `peckboard_create_card`   | Create a card. JSON body (see below).               |
+
+`POST /cards` body — `project_id` and `title` are required; the rest are
+optional and forwarded to core, which validates priority/workflow and that the
+project exists (inheriting the project's workflow when none is given):
+
+```json
+{ "project_id": "<id>", "title": "My card", "description": "", "priority": 1,
+  "step": "backlog", "workflow": "<id>", "model": null, "effort": null }
+```
+
+Status codes: `200` (read), `201` (card created), `400` (missing/invalid
+body), `401` (missing/unknown key), `403` (key lacks the route's scope), `404`
+(unknown project, or a path no plugin claims), `500` (host/data error). Bodies
+are JSON; errors are `{ "error": "..." }`.
+
+## Authentication
+
+Every endpoint except `GET /health` requires a configured API key, presented as
+either header:
+
+```
+Authorization: Bearer <key>
+X-API-Key: <key>
+```
+
+`Authorization: Bearer` wins if both are present. A missing or unknown key is
+`401`; a known key that lacks the route's required scope is `403`. Keys are
+compared in constant time and are never written to logs (the sandbox exposes no
+log host function today, so the plugin does not log at all).
 
 ## Build
 
@@ -65,8 +101,11 @@ Then:
 
 ```bash
 curl http://<host>:<port>/plugin-api/v1/health
-# {"status":"ok","plugin":"api","version":"0.1.0","configured_keys":0}
+# {"status":"ok","plugin":"api","version":"0.1.0","configured_keys":2}
 ```
+
+`configured_keys` reflects how many keys core delivered from `config.json` —
+a quick way to confirm your config reached the plugin.
 
 ## Configuration
 
@@ -89,33 +128,36 @@ Per-plugin config lives under the `plugins.<stem>` key of
 }
 ```
 
-- `keys[].key` — the secret an API client presents (e.g. as a bearer token).
+- `keys[].key` — the secret an API client presents (as a bearer token or
+  `X-API-Key`).
 - `keys[].scopes` — what the key may do. `read` for read-only endpoints,
   `write` for mutating ones (matching the scoped-key design used elsewhere).
+- `keys[].label` — optional human name for the key (operator-facing only; the
+  secret itself is never logged).
 
-> **Known core gap:** the plugin's `init` is wired to parse this `config`
-> object, but core currently calls `init` with `"{}"` and exposes no
-> `peckboard_get_config` host function — so configured keys are not yet
-> delivered to the plugin. `init` parses defensively and the health endpoint
-> reports `configured_keys`, so the wiring lights up the moment core passes the
-> config. Closing that gap is tracked outside this scaffold card.
+Core reads the `plugins.<stem>.config` block from `<dataDir>/config.json` and
+passes it to the plugin's `init` as a JSON string (see
+`PluginManager::read_plugin_config` in `peckboard/src/plugin/manager.rs`). A
+missing or malformed `config.json` is non-fatal — the plugin loads with zero
+keys and every authenticated route returns `401`. Config changes are picked up
+on the next Peckboard restart.
 
 ## Plugin interface
 
 Core (`peckboard/src/plugin/manager.rs`) expects four exports:
 
-| Export     | Input (from core)         | This crate does                                              |
-| ---------- | ------------------------- | ----------------------------------------------------------- |
-| `manifest` | `""`                      | Returns `{ "hooks": ["http.request.before"], "http_routes": [...] }` |
-| `init`     | `"{}"` (per-plugin config) | Parses API keys + scopes, stores them, returns `{ "ok": ... }` |
-| `handle`   | `{ "hook", "payload" }`   | Dispatches on hook; serves `http.request.before` (200 health stub) |
-| `shutdown` | `""`                      | No-op                                                        |
+| Export     | Input (from core)                 | This crate does                                              |
+| ---------- | --------------------------------- | ----------------------------------------------------------- |
+| `manifest` | `""`                              | Returns `{ "hooks": ["http.request.before"], "http_routes": [...] }` |
+| `init`     | the `config` block (JSON string)  | Parses API keys + scopes, stores them, returns `{ "ok": ... }` |
+| `handle`   | `{ "hook", "payload" }`           | Dispatches on hook; serves `http.request.before` with the full HTTP response |
+| `shutdown` | `""`                              | No-op                                                        |
 
 ### Host functions
 
-Peckboard exposes data-access host functions to plugins
-(`peckboard/src/plugin/host.rs`). Only three are implemented today and are
-declared in `src/lib.rs` for the endpoints card to call:
+The plugin reads and writes Peckboard data only through data-access host
+functions core wires into the sandbox (`peckboard/src/plugin/host.rs`). The
+three this plugin uses:
 
 - `peckboard_list_projects` — `{}` → `{"projects": [...]}`
 - `peckboard_list_cards` — `{"project_id"?, "step"?}` → `{"cards": [...]}`
@@ -123,7 +165,8 @@ declared in `src/lib.rs` for the endpoints card to call:
 
 Each is JSON-string-in / JSON-string-out and returns an `{"error": "..."}`
 envelope on failure rather than trapping. They are generic and **not**
-scope-aware — scope enforcement is this plugin's responsibility.
+scope-aware — scope enforcement is this plugin's responsibility (the `guard`
+in `src/lib.rs`).
 
 ## Repository
 
