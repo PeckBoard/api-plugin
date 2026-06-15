@@ -191,6 +191,9 @@ copying the config `keys` — see [Configuration](#configuration)). Before that,
 Per-plugin config lives under the `plugins.<stem>` key of
 `<dataDir>/config.json`. For this plugin (`api.wasm`):
 
+Full example with every scope (file: `<dataDir>/config.json`, e.g.
+`/home/firestar/.peckboard/config.json`):
+
 ```json
 {
   "plugins": {
@@ -198,21 +201,47 @@ Per-plugin config lives under the `plugins.<stem>` key of
       "enabled": true,
       "config": {
         "keys": [
-          { "key": "REPLACE_WITH_A_SECRET", "scopes": ["read"] },
-          { "key": "REPLACE_WITH_ANOTHER", "scopes": ["read", "write"] }
+          {
+            "key": "pk_read_REPLACE_ME",
+            "label": "read-only dashboard",
+            "scopes": ["read"]
+          },
+          {
+            "key": "pk_write_REPLACE_ME",
+            "label": "ci card creator",
+            "scopes": ["read", "write"]
+          },
+          {
+            "key": "pk_admin_REPLACE_ME",
+            "label": "key manager",
+            "scopes": ["admin"]
+          },
+          {
+            "key": "pk_full_REPLACE_ME",
+            "label": "full access",
+            "scopes": ["read", "write", "admin"]
+          }
         ],
-        "bootstrap_admin_key": "REPLACE_WITH_AN_ADMIN_SECRET"
+        "bootstrap_admin_key": "pk_bootstrap_REPLACE_ME"
       }
     }
   }
 }
 ```
 
-- `keys[].key` — the secret an API client presents (as a bearer token or
-  `X-API-Key`).
-- `keys[].scopes` — what the key may do. `read` for read-only endpoints,
-  `write` for mutating ones, `admin` for key management (matching the
-  scoped-key design used elsewhere).
+- `enabled` — whether Peckboard loads/uses the plugin (top-level, alongside
+  `config`).
+- `keys[].key` — the secret an API client presents, either as
+  `Authorization: Bearer <key>` or the `X-API-Key` header.
+- `keys[].scopes` — what the key may do. Valid scopes (explicit, no implication
+  between them):
+  - `read` — read-only data endpoints (`GET /projects`, `GET /cards`).
+  - `write` — mutating data endpoints (`POST /cards`). Pair with `read` if the
+    client also lists.
+  - `admin` — key-management endpoints (`GET/POST/DELETE /keys`). An
+    `admin`-only key can manage keys but cannot call the data routes.
+  - Combine them in one key (`["read", "write", "admin"]`) for full access.
+    Unknown scopes are rejected when a key is minted.
 - `keys[].label` — optional human name for the key (operator-facing only; the
   secret itself is never logged).
 - `bootstrap_admin_key` — optional break-glass admin secret. It is **always**
