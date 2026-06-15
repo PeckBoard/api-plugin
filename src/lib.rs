@@ -988,9 +988,14 @@ fn admin_page() -> String {
                 "content-type": "text/html; charset=utf-8",
                 "access-control-allow-origin": "*",
                 "x-content-type-options": "nosniff",
+                // Core exempts /plugin-api from its own security headers, so
+                // this plugin owns its page's CSP — including framing:
+                // `frame-ancestors 'self'` lets Peckboard embed the page in its
+                // same-origin panel iframe while forbidding any foreign framer.
                 "content-security-policy":
                     "default-src 'none'; connect-src 'self'; style-src 'self'; \
-                     script-src 'self'; base-uri 'none'; form-action 'none'",
+                     script-src 'self'; base-uri 'none'; form-action 'none'; \
+                     frame-ancestors 'self'",
             },
             "body": ADMIN_HTML,
         },

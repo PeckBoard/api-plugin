@@ -80,6 +80,54 @@ call the data routes, and a `read`/`write` key cannot manage keys. The one
 exception is the config `bootstrap_admin_key`, which carries full
 `[read, write, admin]`.
 
+## Management UI page
+
+The plugin serves its **own** management page — a small static site (HTML +
+two same-origin assets) that lets an operator connect with an `admin` key and
+list / create / revoke API keys from the browser:
+
+| Method & path                  | Description                                  |
+| ------------------------------ | -------------------------------------------- |
+| `GET /plugin-api/v1/admin`     | The management page (HTML).                  |
+| `GET /plugin-api/v1/admin.css` | Stylesheet (linked, not inlined).            |
+| `GET /plugin-api/v1/admin.js`  | Script (linked, not inlined).                |
+| `OPTIONS /plugin-api/v1/*`     | CORS preflight catch-all (returns `204`).    |
+
+The CSS/JS are **separate routes**, not inlined, on purpose: Peckboard's
+`security_headers` serves the page under a strict `script-src 'self';
+style-src 'self'` CSP (no `'unsafe-inline'`), so linked same-origin assets load
+but inline `<script>`/`<style>` would be blocked.
+
+**Where it shows up.** The plugin's `manifest` declares a `ui_panels` entry:
+
+```json
+{ "id": "api-keys", "title": "API Keys", "path": "/plugin-api/v1/admin" }
+```
+
+Peckboard's generic `ui_panels` rendering surfaces this as a link in the
+**user dropdown menu** (the avatar menu) — test id
+`user-menu-plugin-api-api-keys`. Selecting it opens a modal containing a
+sandboxed `<iframe>` pointed at `/plugin-api/v1/admin`. The iframe is sandboxed
+**without** `allow-same-origin`, so the page runs with an opaque origin: it
+cannot read the host app's session, and its `fetch` calls back to
+`/plugin-api/*` are cross-origin (hence the permissive, credential-free CORS
+headers + the `OPTIONS` preflight route above). The page therefore asks the
+operator to **paste an `admin` key** (or the `bootstrap_admin_key`), kept in
+memory only, to authorize the `/plugin-api/v1/keys` calls — nothing is read
+from the host session. The same panels are also listed under Settings →
+Plugins → "Plugin Pages".
+
+> **Plugin-defined security headers.** Peckboard core stamps a strict
+> `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'` on `/api/*` responses,
+> which would forbid framing this page. For the `/plugin-api/*` prefix, core
+> instead **defers to the headers the plugin returns** (it applies the plugin's
+> per-response headers verbatim and adds none of its own; it also skips its
+> Origin/CSRF check there). So this plugin sets its **own** policy on the admin
+> page — including `frame-ancestors 'self'` — which lets Peckboard frame it
+> same-origin in the user-menu iframe while forbidding any foreign framer.
+> `/api/*` is untouched. The management **endpoints** (`/plugin-api/v1/keys`)
+> also work from any HTTP client (`curl`, etc.) independent of the UI.
+
 ## Build
 
 The plugin targets `wasm32-unknown-unknown`.
@@ -130,7 +178,7 @@ Then:
 
 ```bash
 curl http://<host>:<port>/plugin-api/v1/health
-# {"status":"ok","plugin":"api","version":"0.1.0","keys":2,"seeded":false}
+# {"status":"ok","plugin":"api","version":"0.2.0","keys":2,"seeded":false}
 ```
 
 `keys` is how many keys exist; `seeded` is whether the managed key set has been
@@ -200,7 +248,7 @@ Core (`peckboard/src/plugin/manager.rs`) expects four exports:
 
 | Export     | Input (from core)                 | This crate does                                              |
 | ---------- | --------------------------------- | ----------------------------------------------------------- |
-| `manifest` | `""`                              | Returns `{ "hooks": ["http.request.before"], "http_routes": [...] }` |
+| `manifest` | `""`                              | Returns `{ "hooks": ["http.request.before"], "http_routes": [...], "ui_panels": [...] }` |
 | `init`     | the `config` block (JSON string)  | Parses API keys + scopes, stores them, returns `{ "ok": ... }` |
 | `handle`   | `{ "hook", "payload" }`           | Dispatches on hook; serves `http.request.before` with the full HTTP response |
 | `shutdown` | `""`                              | No-op                                                        |

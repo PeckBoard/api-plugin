@@ -1,6 +1,6 @@
 [package]
 name = "peckboard-api-plugin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Public, API-key-authenticated HTTP surface for Peckboard, served as a WASM plugin."
 license = "MIT"
