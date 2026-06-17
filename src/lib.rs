@@ -218,10 +218,17 @@ fn config_snapshot() -> ApiConfig {
         .unwrap_or_default()
 }
 
-/// `manifest` — declare the hooks handled and the routes owned.
+/// `manifest` — declare the plugin's identity (description / version /
+/// source repository, all required by the host and shown on the plugin's
+/// card) plus the hooks handled and the routes owned. The identity fields
+/// come straight from `Cargo.toml` via `CARGO_PKG_*`, so they can't drift
+/// from the crate's own metadata.
 #[plugin_fn]
 pub fn manifest() -> FnResult<String> {
     let manifest = serde_json::json!({
+        "description": env!("CARGO_PKG_DESCRIPTION"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "repository": env!("CARGO_PKG_REPOSITORY"),
         "hooks": ["http.request.before"],
         "http_routes": ROUTES,
         // The management page this plugin serves at `/plugin-api/v1/admin`,

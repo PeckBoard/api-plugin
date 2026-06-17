@@ -3,6 +3,7 @@ name = "peckboard-api-plugin"
 version = "0.2.0"
 edition = "2024"
 description = "Public, API-key-authenticated HTTP surface for Peckboard, served as a WASM plugin."
+repository = "https://github.com/PeckBoard/api-plugin"
 license = "MIT"
 publish = false
 
